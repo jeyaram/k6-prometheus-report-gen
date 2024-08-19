@@ -1,0 +1,40 @@
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: testrun-generate-report
+spec:
+  parallelism: 1
+  cleanup: post
+  script:
+    configMap:
+      name: k6-test-scripts
+      file: generate-k6-test-report.js
+  arguments:
+    env:
+      - name: PROMETHEUS_URL
+        value: "http://prometheus-service.default.svc.cluster.local:9090"
+      - name: TESTID
+        value: "my-test-id"
+      - name: DURATION_HOURS
+        value: "1"
+      - name: MINIO_URL
+        value: "http://minio-service.default.svc.cluster.local:9000"
+      - name: MINIO_BUCKET
+        value: "k6-results"
+      - name: K8S_API_URL
+        value: "https://kubernetes.default.svc"
+      - name: TARGET_TEST_RUN_NAME
+        value: "another-testrun"
+      - name: TARGET_NAMESPACE
+        value: "target-namespace-name"
+      - name: MINIO_ACCESS_KEY
+        valueFrom:
+          secretKeyRef:
+            name: minio-credentials
+            key: MINIO_ACCESS_KEY
+      - name: MINIO_SECRET_KEY
+        valueFrom:
+          secretKeyRef:
+            name: minio-credentials
+            key: MINIO_SECRET_KEY
+  separate: true
