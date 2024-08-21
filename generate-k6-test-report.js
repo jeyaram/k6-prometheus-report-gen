@@ -1,7 +1,7 @@
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { readFileSync } from 'fs';
-import { encoding, hmac } from 'k6/crypto';
+import { AWSClient } from 'https://jslib.k6.io/aws/0.12.3/aws.js';
 
 // Environment variables
 const prometheusUrl = __ENV.PROMETHEUS_URL;
@@ -35,60 +35,35 @@ function queryPrometheus(query) {
     return JSON.parse(res.body).data.result[0]?.values.map(v => parseFloat(v[1])) || [];
 }
 
-// Function to convert hex to binary
-function hexToBinary(hex) {
-    const bytes = [];
-    for (let i = 0; i < hex.length; i += 2) {
-        bytes.push(String.fromCharCode(parseInt(hex.substr(i, 2), 16)));
-    }
-    return bytes.join('');
-}
-
-function getSignatureKey(key, dateStamp, regionName, serviceName) {
-    const kDate = hmac('sha256', 'AWS4' + key, dateStamp, 'hex');
-    const kRegion = hmac('sha256', hexToBinary(kDate), regionName, 'hex');
-    const kService = hmac('sha256', hexToBinary(kRegion), serviceName, 'hex');
-    const kSigning = hmac('sha256', hexToBinary(kService), 'aws4_request', 'hex');
-    return hexToBinary(kSigning);
-}
 
 function saveResultsToMinio(filename, content) {
-    const method = 'PUT';
+    const region = 'us-east-1'; // The region can be anything since MinIO ignores it, but it is required for signing
     const service = 's3';
-    const region = 'us-east-1'; // MinIO typically ignores the region, but AWS4 requires one
-    const host = `${__ENV.MINIO_URL.replace('http://', '').replace('https://', '')}`;
-    const endpoint = `/${__ENV.MINIO_BUCKET}/${filename}`;
-    const accessKey = __ENV.MINIO_ACCESS_KEY;
-    const secretKey = __ENV.MINIO_SECRET_KEY;
 
-    const now = new Date();
-    const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, ''); // YYYYMMDD'T'HHMMSS'Z'
-    const dateStamp = amzDate.slice(0, 8); // YYYYMMDD
+    const awsClient = new AWSClient({
+        accessKeyId: __ENV.MINIO_ACCESS_KEY,
+        secretAccessKey: __ENV.MINIO_SECRET_KEY,
+        service: service,
+        region: region,
+        endpoint: __ENV.MINIO_URL, // MinIO endpoint
+    });
 
-    const payloadHash = encoding.hexEncode(encoding.sha256(content || ''));
-    const canonicalUri = endpoint;
-    const canonicalQuerystring = '';
-    const canonicalHeaders = `host:${host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`;
-    const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
-
-    const canonicalRequest = `${method}\n${canonicalUri}\n${canonicalQuerystring}\n${canonicalHeaders}\n${signedHeaders}\n${payloadHash}`;
-    const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
-    const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${credentialScope}\n${encoding.hexEncode(encoding.sha256(canonicalRequest))}`;
-
-    const signingKey = getSignatureKey(secretKey, dateStamp, region, service);
-    const signature = encoding.hexEncode(hmac('sha256', signingKey, stringToSign, 'hex'));
-
-    const authorizationHeader = `AWS4-HMAC-SHA256 Credential=${accessKey}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+    const bucket = __ENV.MINIO_BUCKET;
+    const path = `/${bucket}/${filename}`;
+    const url = `${__ENV.MINIO_URL}${path}`;
 
     const headers = {
-        'Authorization': authorizationHeader,
-        'x-amz-content-sha256': payloadHash,
-        'x-amz-date': amzDate,
         'Content-Type': 'text/plain',
     };
 
-    const url = `${__ENV.MINIO_URL}${canonicalUri}`;
-    const res = http.put(url, content, { headers: headers });
+    const res = awsClient.signAndSend({
+        method: 'PUT',
+        protocol: 'https', // Ensure you use the correct protocol (http or https)
+        hostname: __ENV.MINIO_URL.replace(/^https?:\/\//, ''), // Remove protocol from URL
+        path: path,
+        headers: headers,
+        body: content,
+    });
 
     check(res, { 'Uploaded results to MinIO': (r) => r.status === 200 });
 }
