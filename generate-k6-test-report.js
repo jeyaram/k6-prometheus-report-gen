@@ -1,8 +1,7 @@
 import http from 'k6/http';
 import { check, sleep } from 'k6';
-import { encoding } from 'k6/encoding';
 import { readFileSync } from 'fs';
-import { hmac } from 'k6/crypto';
+import { encoding, hmac } from 'k6/crypto';
 
 // Environment variables
 const prometheusUrl = __ENV.PROMETHEUS_URL;
@@ -36,12 +35,21 @@ function queryPrometheus(query) {
     return JSON.parse(res.body).data.result[0]?.values.map(v => parseFloat(v[1])) || [];
 }
 
+// Function to convert hex to binary
+function hexToBinary(hex) {
+    const bytes = [];
+    for (let i = 0; i < hex.length; i += 2) {
+        bytes.push(String.fromCharCode(parseInt(hex.substr(i, 2), 16)));
+    }
+    return bytes.join('');
+}
+
 function getSignatureKey(key, dateStamp, regionName, serviceName) {
-    const kDate = hmac('sha256', 'AWS4' + key, dateStamp, 'raw');
-    const kRegion = hmac('sha256', kDate, regionName, 'raw');
-    const kService = hmac('sha256', kRegion, serviceName, 'raw');
-    const kSigning = hmac('sha256', kService, 'aws4_request', 'raw');
-    return kSigning;
+    const kDate = hmac('sha256', 'AWS4' + key, dateStamp, 'hex');
+    const kRegion = hmac('sha256', hexToBinary(kDate), regionName, 'hex');
+    const kService = hmac('sha256', hexToBinary(kRegion), serviceName, 'hex');
+    const kSigning = hmac('sha256', hexToBinary(kService), 'aws4_request', 'hex');
+    return hexToBinary(kSigning);
 }
 
 function saveResultsToMinio(filename, content) {
@@ -83,40 +91,6 @@ function saveResultsToMinio(filename, content) {
     const res = http.put(url, content, { headers: headers });
 
     check(res, { 'Uploaded results to MinIO': (r) => r.status === 200 });
-}
-// Function to wait for the completion and cleanup of a TestRun
-function waitForTestRunCompletion() {
-    const url = `${k8sApiUrl}/apis/k6.io/v1alpha1/namespaces/${targetNamespace}/testruns/${targetTestRunName}`;
-    const headers = {
-        'Authorization': `Bearer ${bearerToken}`,
-        'Accept': 'application/json',
-    };
-
-    while (true) {
-        const res = http.get(url, {
-            headers: headers,
-            timeout: 60000, // 60 seconds timeout for the request
-            responseType: 'text',
-            tags: { name: 'GetTestRunStatus' },
-            tlsAuth: [{ cert: '', key: '' }],
-            tlsCaCerts: [caCert],  // Use the CA cert from the service account
-            maxRedirects: 0
-        });
-
-        if (res.status === 404) {
-            console.log(`TestRun "${targetTestRunName}" has been cleaned up and no longer exists.`);
-            break;
-        } else if (res.status !== 200) {
-            console.error(`Failed to get the status of the TestRun "${targetTestRunName}". Status: ${res.status}`);
-            break;
-        }
-
-        const responseBody = JSON.parse(res.body);
-        const status = responseBody.status.phase;
-
-        console.log(`Waiting for TestRun "${targetTestRunName}" to complete and be cleaned up... Current status: ${status}`);
-        sleep(10);  // Poll every 10 seconds
-    }
 }
 
 // Main function
