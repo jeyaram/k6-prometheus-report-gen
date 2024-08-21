@@ -2,6 +2,7 @@ import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { encoding } from 'k6/encoding';
 import { readFileSync } from 'fs';
+import { hmac } from 'k6/crypto';
 
 // Environment variables
 const prometheusUrl = __ENV.PROMETHEUS_URL;
@@ -35,22 +36,54 @@ function queryPrometheus(query) {
     return JSON.parse(res.body).data.result[0]?.values.map(v => parseFloat(v[1])) || [];
 }
 
-function saveResultsToMinio(filename, content) {
-    const url = `${minioUrl}/${minioBucket}/${filename}`;
-
-    // Encode the access key and secret key in base64
-    const credentials = `${minioAccessKey}:${minioSecretKey}`;
-    const encodedCredentials = encoding.b64encode(credentials);
-
-    const headers = {
-        'Content-Type': 'text/plain',
-        'Authorization': `Basic ${encodedCredentials}`,
-    };
-
-    const res = http.put(url, content, { headers: headers });
-    check(res, { 'Uploaded results to MinIO': (r) => r.status === 200 });
+function getSignatureKey(key, dateStamp, regionName, serviceName) {
+    const kDate = hmac('sha256', 'AWS4' + key, dateStamp, 'raw');
+    const kRegion = hmac('sha256', kDate, regionName, 'raw');
+    const kService = hmac('sha256', kRegion, serviceName, 'raw');
+    const kSigning = hmac('sha256', kService, 'aws4_request', 'raw');
+    return kSigning;
 }
 
+function saveResultsToMinio(filename, content) {
+    const method = 'PUT';
+    const service = 's3';
+    const region = 'us-east-1'; // MinIO typically ignores the region, but AWS4 requires one
+    const host = `${__ENV.MINIO_URL.replace('http://', '').replace('https://', '')}`;
+    const endpoint = `/${__ENV.MINIO_BUCKET}/${filename}`;
+    const accessKey = __ENV.MINIO_ACCESS_KEY;
+    const secretKey = __ENV.MINIO_SECRET_KEY;
+
+    const now = new Date();
+    const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, ''); // YYYYMMDD'T'HHMMSS'Z'
+    const dateStamp = amzDate.slice(0, 8); // YYYYMMDD
+
+    const payloadHash = encoding.hexEncode(encoding.sha256(content || ''));
+    const canonicalUri = endpoint;
+    const canonicalQuerystring = '';
+    const canonicalHeaders = `host:${host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`;
+    const signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
+
+    const canonicalRequest = `${method}\n${canonicalUri}\n${canonicalQuerystring}\n${canonicalHeaders}\n${signedHeaders}\n${payloadHash}`;
+    const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+    const stringToSign = `AWS4-HMAC-SHA256\n${amzDate}\n${credentialScope}\n${encoding.hexEncode(encoding.sha256(canonicalRequest))}`;
+
+    const signingKey = getSignatureKey(secretKey, dateStamp, region, service);
+    const signature = encoding.hexEncode(hmac('sha256', signingKey, stringToSign, 'hex'));
+
+    const authorizationHeader = `AWS4-HMAC-SHA256 Credential=${accessKey}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+    const headers = {
+        'Authorization': authorizationHeader,
+        'x-amz-content-sha256': payloadHash,
+        'x-amz-date': amzDate,
+        'Content-Type': 'text/plain',
+    };
+
+    const url = `${__ENV.MINIO_URL}${canonicalUri}`;
+    const res = http.put(url, content, { headers: headers });
+
+    check(res, { 'Uploaded results to MinIO': (r) => r.status === 200 });
+}
 // Function to wait for the completion and cleanup of a TestRun
 function waitForTestRunCompletion() {
     const url = `${k8sApiUrl}/apis/k6.io/v1alpha1/namespaces/${targetNamespace}/testruns/${targetTestRunName}`;
